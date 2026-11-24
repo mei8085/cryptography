@@ -16,6 +16,12 @@ import pytest
 import cryptography_vectors
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
+# A Fernet token stamped at ``issued_at`` is accepted at ``now`` when
+# ``issued_at - _MAX_CLOCK_SKEW <= now <= issued_at + ttl``. Both ends of
+# the window are inclusive; the rotation tests below pin this contract down.
+_MAX_CLOCK_SKEW = 60
+_TTL = 100
+
 
 def json_parametrize(keys, filename):
     vector_file = cryptography_vectors.open_vector_file(
@@ -316,3 +322,272 @@ class TestMultiFernet:
             mf1.extract_timestamp("abc")
         with pytest.raises(InvalidToken):
             mf1.extract_timestamp("")
+
+
+def _fernet(seed: int) -> Fernet:
+    """A deterministic Fernet instance, distinct per ``seed``."""
+    return Fernet(base64.urlsafe_b64encode(bytes([seed]) * 32))
+
+
+class TestMultiFernetRotationTimeValidity:
+    """Key rotation must not re-stamp a token.
+
+    ``MultiFernet.rotate`` re-encrypts an existing token under the primary
+    key but keeps its original issuance time, so the rotated token is bound
+    to exactly the same TTL/clock-skew window as the token it replaced. It
+    gains no new lifetime from being written under a new key. Newly issued
+    tokens are always produced (and timestamped) by the primary key.
+    """
+
+    issued = 1526138327
+    plaintext = b"encrypt me"
+
+    def _rotated(self, issued_at: int) -> tuple[bytes, bytes, Fernet]:
+        """Return ``(original, rotated, new_primary)`` for a token."""
+        old = _fernet(0)
+        new = _fernet(1)
+        original = old.encrypt_at_time(self.plaintext, issued_at)
+        rotated = MultiFernet([new, old]).rotate(original)
+        return original, rotated, new
+
+    @pytest.mark.parametrize("as_str", [False, True])
+    def test_rotate_preserves_original_issuance_time(self, as_str):
+        old = _fernet(0)
+        new = _fernet(1)
+        token = old.encrypt_at_time(self.plaintext, self.issued)
+        msg = token.decode("ascii") if as_str else token
+
+        rotated = MultiFernet([new, old]).rotate(msg)
+
+        rotated_ts, _ = Fernet._get_unverified_token_data(rotated)
+        assert rotated_ts == self.issued
+        # The token really moved to the new primary key: the old key alone
+        # can no longer read it, the new one can.
+        assert MultiFernet([new]).decrypt(rotated) == self.plaintext
+        with pytest.raises(InvalidToken):
+            old.decrypt(rotated)
+
+    def test_rotate_does_not_extend_validity(self):
+        _, rotated, new = self._rotated(self.issued)
+        mf = MultiFernet([new])
+
+        # At the TTL boundary the rotated token is still usable.
+        assert (
+            mf.decrypt_at_time(
+                rotated, ttl=_TTL, current_time=self.issued + _TTL
+            )
+            == self.plaintext
+        )
+        # One second later it is expired, exactly like the original would
+        # have been had its key not been rotated.
+        with pytest.raises(InvalidToken):
+            mf.decrypt_at_time(
+                rotated, ttl=_TTL, current_time=self.issued + _TTL + 1
+            )
+
+    @pytest.mark.parametrize(
+        ("offset", "valid"),
+        [
+            (-_MAX_CLOCK_SKEW - 1, False),
+            (-_MAX_CLOCK_SKEW, True),
+            (-1, True),
+            (0, True),
+            (_TTL, True),
+            (_TTL + 1, False),
+        ],
+        ids=[
+            "too-far-in-future",
+            "max-clock-skew",
+            "just-before-issuance",
+            "at-issuance",
+            "at-ttl-boundary",
+            "past-ttl",
+        ],
+    )
+    def test_rotated_token_keeps_decryption_contract(self, offset, valid):
+        original, rotated, new = self._rotated(self.issued)
+        now = self.issued + offset
+
+        # The rotated token is readable from the new primary key alone, and
+        # keeps the original token's validity window.
+        for mf in (MultiFernet([new]), MultiFernet([new, _fernet(0)])):
+            if valid:
+                assert (
+                    mf.decrypt_at_time(rotated, ttl=_TTL, current_time=now)
+                    == self.plaintext
+                )
+            else:
+                with pytest.raises(InvalidToken):
+                    mf.decrypt_at_time(rotated, ttl=_TTL, current_time=now)
+
+        # The unrotated token obeys the same window while its key is still in
+        # the rotation set.
+        rotation_set = MultiFernet([new, _fernet(0)])
+        if valid:
+            assert (
+                rotation_set.decrypt_at_time(
+                    original, ttl=_TTL, current_time=now
+                )
+                == self.plaintext
+            )
+        else:
+            with pytest.raises(InvalidToken):
+                rotation_set.decrypt_at_time(
+                    original, ttl=_TTL, current_time=now
+                )
+
+    @pytest.mark.parametrize(
+        ("offset", "valid"),
+        [
+            (-_MAX_CLOCK_SKEW - 1, False),
+            (-_MAX_CLOCK_SKEW, True),
+            (0, True),
+            (_TTL, True),
+            (_TTL + 1, False),
+        ],
+    )
+    def test_wall_clock_agrees_with_explicit_time_after_rotation(
+        self, monkeypatch, offset, valid
+    ):
+        _, rotated, new = self._rotated(self.issued)
+        mf = MultiFernet([new])
+        now = self.issued + offset
+        monkeypatch.setattr(time, "time", lambda: now)
+
+        if valid:
+            assert mf.decrypt(rotated, ttl=_TTL) == self.plaintext
+        else:
+            with pytest.raises(InvalidToken):
+                mf.decrypt(rotated, ttl=_TTL)
+
+        # The clock-based and explicit-time paths must agree.
+        if valid:
+            assert (
+                mf.decrypt_at_time(rotated, ttl=_TTL, current_time=now)
+                == self.plaintext
+            )
+        else:
+            with pytest.raises(InvalidToken):
+                mf.decrypt_at_time(rotated, ttl=_TTL, current_time=now)
+
+    def test_rotate_of_expired_token_stays_expired(self):
+        original, rotated, new = self._rotated(self.issued)
+        mf = MultiFernet([new, _fernet(0)])
+        expired_at = self.issued + _TTL + 1
+
+        # Rotating is decryption-followed-by-encryption, so an expired token
+        # can still be rotated (the TTL is not consulted), but rotation is
+        # not a re-issuance...
+        rotated_ts, _ = Fernet._get_unverified_token_data(rotated)
+        assert rotated_ts == self.issued
+
+        # ...so both the original and the rotated token remain expired.
+        for token in (original, rotated):
+            with pytest.raises(InvalidToken):
+                mf.decrypt_at_time(token, ttl=_TTL, current_time=expired_at)
+            # Without a TTL the timestamp is never consulted: expiry is the
+            # caller's policy, not a property rotation bakes into the token.
+            assert mf.decrypt(token) == self.plaintext
+
+    def test_rotate_preserves_future_skew_violation(self):
+        old = _fernet(0)
+        new = _fernet(1)
+        mf = MultiFernet([new, old])
+        future = self.issued + 3600
+        rotated = mf.rotate(old.encrypt_at_time(self.plaintext, future))
+
+        rotated_ts, _ = Fernet._get_unverified_token_data(rotated)
+        assert rotated_ts == future
+        # Still too far in the future relative to "now" to be accepted.
+        with pytest.raises(InvalidToken):
+            mf.decrypt_at_time(rotated, ttl=_TTL, current_time=self.issued)
+        # It becomes readable once the clock catches up to the skew window.
+        assert (
+            mf.decrypt_at_time(
+                rotated,
+                ttl=_TTL,
+                current_time=future - _MAX_CLOCK_SKEW,
+            )
+            == self.plaintext
+        )
+
+    def test_repeated_rotation_never_refreshes_issue_time(self):
+        k1, k2, k3 = _fernet(0), _fernet(1), _fernet(2)
+        token = k1.encrypt_at_time(self.plaintext, self.issued)
+        token = MultiFernet([k2, k1]).rotate(token)
+        token = MultiFernet([k3, k2]).rotate(token)
+
+        assert Fernet._get_unverified_token_data(token)[0] == self.issued
+        assert (
+            MultiFernet([k3]).decrypt_at_time(
+                token, ttl=_TTL, current_time=self.issued + _TTL
+            )
+            == self.plaintext
+        )
+        with pytest.raises(InvalidToken):
+            MultiFernet([k3]).decrypt_at_time(
+                token, ttl=_TTL, current_time=self.issued + _TTL + 1
+            )
+
+    def test_old_token_readable_only_while_key_is_in_the_set(self):
+        old, new = _fernet(0), _fernet(1)
+        token = old.encrypt_at_time(self.plaintext, self.issued)
+        rotation_set = MultiFernet([new, old])
+
+        # The old token is readable through the rotation set, on its own
+        # original schedule (without a TTL the timestamp is not consulted).
+        assert rotation_set.decrypt(token) == self.plaintext
+        assert rotation_set.extract_timestamp(token) == self.issued
+        assert (
+            rotation_set.decrypt_at_time(
+                token, ttl=_TTL, current_time=self.issued + _TTL
+            )
+            == self.plaintext
+        )
+        # Once the old key is retired, the unrotated token is unreadable
+        # even though its timestamp is still inside the TTL window.
+        retired_set = MultiFernet([new])
+        with pytest.raises(InvalidToken):
+            retired_set.decrypt_at_time(
+                token, ttl=_TTL, current_time=self.issued
+            )
+        with pytest.raises(InvalidToken):
+            retired_set.extract_timestamp(token)
+
+    def test_new_tokens_are_issued_by_primary_key_at_current_time(
+        self, monkeypatch
+    ):
+        old, new = _fernet(0), _fernet(1)
+        mf = MultiFernet([new, old])
+        now = self.issued
+        monkeypatch.setattr(time, "time", lambda: now)
+
+        token = mf.encrypt(self.plaintext)
+
+        assert mf.extract_timestamp(token) == now
+        assert MultiFernet([new]).decrypt(token, ttl=_TTL) == self.plaintext
+        # The old key is only a reader; it must not have signed the token.
+        with pytest.raises(InvalidToken):
+            old.decrypt(token)
+        with pytest.raises(InvalidToken):
+            MultiFernet([old]).decrypt(token, ttl=_TTL)
+
+    def test_rotation_does_not_reissue_new_token_timestamp(self, monkeypatch):
+        old, new = _fernet(0), _fernet(1)
+        mf = MultiFernet([new, old])
+
+        # Issue through the rotation set at the original time.
+        monkeypatch.setattr(time, "time", lambda: self.issued)
+        token = mf.encrypt(self.plaintext)
+
+        # Rotate later; the issuance time must stay `self.issued`, not `now`.
+        monkeypatch.setattr(time, "time", lambda: self.issued + _TTL // 2)
+        rotated = mf.rotate(token)
+        assert mf.extract_timestamp(rotated) == self.issued
+
+        # Hence the rotated token expires on the *original* schedule.
+        monkeypatch.setattr(time, "time", lambda: self.issued + _TTL + 1)
+        with pytest.raises(InvalidToken):
+            mf.decrypt(rotated, ttl=_TTL)
+        monkeypatch.setattr(time, "time", lambda: self.issued + _TTL)
+        assert mf.decrypt(rotated, ttl=_TTL) == self.plaintext
