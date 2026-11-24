@@ -4,6 +4,7 @@
 
 
 import contextlib
+import datetime
 import email.parser
 import os
 import typing
@@ -23,6 +24,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.x509.oid import NameOID
 from tests.doubles import DummyRSAPrivateKey
 from tests.x509.test_x509 import _generate_ca_and_leaf
 
@@ -1495,6 +1497,339 @@ class TestPKCS7Decrypt:
             pkcs7.pkcs7_decrypt_der(
                 enveloped, certificate, DummyRSAPrivateKey(), []
             )
+
+
+_ContentEncryptionAlgorithm = typing.Union[
+    type[algorithms.AES128], type[algorithms.AES256]
+]
+
+
+def _generate_self_signed_rsa_identity(
+    common_name: str, serial_number: int
+) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+    # Each identity gets a distinct (issuer, serial number) pair, since that is
+    # exactly the IssuerAndSerialNumber tuple recipient selection matches on.
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(private_key.public_key())
+        .serial_number(serial_number)
+        .not_valid_before(datetime.datetime(2024, 1, 1))
+        .not_valid_after(datetime.datetime(2030, 1, 1))
+        .sign(private_key, hashes.SHA256())
+    )
+    return certificate, private_key
+
+
+@pytest.mark.supported(
+    only_if=lambda backend: backend.rsa_encryption_supported(
+        padding.PKCS1v15()
+    ),
+    skip_message="Requires OpenSSL with PKCS1 v1.5 padding support",
+)
+class TestPKCS7EnvelopeMultiRecipient:
+    # The message deliberately contains bare newlines so the canonicalization
+    # performed outside Binary mode is observable in the recovered plaintext.
+    DATA = b"multi-recipient envelope\nsecond line\n"
+    # Raised by the decrypt path when no RecipientInfo matches the supplied
+    # certificate's issuer and serial number.
+    NO_RECIPIENT_MATCH = (
+        r"No recipient found that matches the given certificate."
+    )
+
+    @pytest.fixture(name="recipient_one", scope="class")
+    @staticmethod
+    def fixture_recipient_one() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+        return _generate_self_signed_rsa_identity("recipient-one", 1001)
+
+    @pytest.fixture(name="recipient_two", scope="class")
+    @staticmethod
+    def fixture_recipient_two() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+        return _generate_self_signed_rsa_identity("recipient-two", 1002)
+
+    @pytest.fixture(name="outsider", scope="class")
+    @staticmethod
+    def fixture_outsider() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+        # A complete, valid cert/key pair that is not a recipient of any
+        # envelope built in these tests.
+        return _generate_self_signed_rsa_identity("outsider", 1003)
+
+    @pytest.fixture(name="matrix", scope="class")
+    @staticmethod
+    def fixture_matrix(
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+        recipient_two: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> list[
+        tuple[
+            serialization.Encoding,
+            _ContentEncryptionAlgorithm,
+            list[pkcs7.PKCS7Options],
+            bytes,
+        ]
+    ]:
+        cert_one, _ = recipient_one
+        cert_two, _ = recipient_two
+        cases: list[
+            tuple[
+                serialization.Encoding,
+                _ContentEncryptionAlgorithm,
+                list[pkcs7.PKCS7Options],
+                bytes,
+            ]
+        ] = []
+        # Every supported envelope representation, both supported content
+        # encryption algorithms, and every body representation that the
+        # representation allows.
+        for content_algorithm in (algorithms.AES128, algorithms.AES256):
+            for encoding in (
+                serialization.Encoding.DER,
+                serialization.Encoding.PEM,
+                serialization.Encoding.SMIME,
+            ):
+                option_sets: list[list[pkcs7.PKCS7Options]] = [
+                    [],
+                    [pkcs7.PKCS7Options.Binary],
+                ]
+                if encoding == serialization.Encoding.SMIME:
+                    option_sets.append([pkcs7.PKCS7Options.Text])
+                for options in option_sets:
+                    enveloped = (
+                        pkcs7.PKCS7EnvelopeBuilder()
+                        .set_data(TestPKCS7EnvelopeMultiRecipient.DATA)
+                        .set_content_encryption_algorithm(content_algorithm)
+                        .add_recipient(cert_one)
+                        .add_recipient(cert_two)
+                        .encrypt(encoding, options)
+                    )
+                    cases.append(
+                        (encoding, content_algorithm, options, enveloped)
+                    )
+        return cases
+
+    @staticmethod
+    def _decrypt_for_encoding(
+        encoding: serialization.Encoding,
+    ) -> typing.Callable[..., bytes]:
+        return {
+            serialization.Encoding.DER: pkcs7.pkcs7_decrypt_der,
+            serialization.Encoding.PEM: pkcs7.pkcs7_decrypt_pem,
+            serialization.Encoding.SMIME: pkcs7.pkcs7_decrypt_smime,
+        }[encoding]
+
+    @staticmethod
+    def _expected_plaintext(options: list[pkcs7.PKCS7Options]) -> bytes:
+        # Binary preserves the body verbatim; every other body representation
+        # canonicalizes bare line feeds to CRLF.
+        if pkcs7.PKCS7Options.Binary in options:
+            return TestPKCS7EnvelopeMultiRecipient.DATA
+        return TestPKCS7EnvelopeMultiRecipient.DATA.replace(b"\n", b"\r\n")
+
+    @staticmethod
+    def _decrypt_options(
+        options: list[pkcs7.PKCS7Options],
+    ) -> list[pkcs7.PKCS7Options]:
+        # Binary is an encryption-time only option; the same body is recovered
+        # by decrypting without it.
+        return [
+            option for option in options if option != pkcs7.PKCS7Options.Binary
+        ]
+
+    def _assert_wrong_key_never_recovers_plaintext(
+        self,
+        decrypt: typing.Callable[..., bytes],
+        enveloped: bytes,
+        certificate: x509.Certificate,
+        wrong_private_key: rsa.RSAPrivateKey,
+        options: list[pkcs7.PKCS7Options],
+    ) -> None:
+        # The certificate selects a real RecipientInfo, but the supplied key
+        # cannot unwrap its session key. RFC 3218 requires this to be
+        # indistinguishable from unwrapping the wrong key: the caller either
+        # gets a content padding error or garbage bytes, never the plaintext
+        # another recipient is entitled to.
+        try:
+            recovered = decrypt(
+                enveloped, certificate, wrong_private_key, options
+            )
+        except ValueError as exc:
+            assert str(exc) == "Invalid padding bytes."
+        else:
+            assert recovered != self._expected_plaintext(options)
+
+    def test_every_recipient_recovers_exact_plaintext_across_matrix(
+        self,
+        matrix: list[
+            tuple[
+                serialization.Encoding,
+                _ContentEncryptionAlgorithm,
+                list[pkcs7.PKCS7Options],
+                bytes,
+            ]
+        ],
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+        recipient_two: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> None:
+        for encoding, _content_algorithm, options, enveloped in matrix:
+            decrypt = self._decrypt_for_encoding(encoding)
+            decrypt_options = self._decrypt_options(options)
+            expected = self._expected_plaintext(options)
+
+            cert_one, key_one = recipient_one
+            cert_two, key_two = recipient_two
+
+            # Each matching cert/key pair must independently recover the exact
+            # plaintext, regardless of the envelope or body representation.
+            assert (
+                decrypt(enveloped, cert_one, key_one, decrypt_options)
+                == expected
+            )
+            assert (
+                decrypt(enveloped, cert_two, key_two, decrypt_options)
+                == expected
+            )
+
+    def test_unknown_recipient_identity_is_rejected_across_matrix(
+        self,
+        matrix: list[
+            tuple[
+                serialization.Encoding,
+                _ContentEncryptionAlgorithm,
+                list[pkcs7.PKCS7Options],
+                bytes,
+            ]
+        ],
+        outsider: tuple[x509.Certificate, rsa.RSAPrivateKey],
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> None:
+        outsider_cert, outsider_key = outsider
+        cert_one, key_one = recipient_one
+        for encoding, _content_algorithm, options, enveloped in matrix:
+            decrypt = self._decrypt_for_encoding(encoding)
+            decrypt_options = self._decrypt_options(options)
+
+            # A valid cert/key pair that matches no RecipientInfo must fail
+            # the identity lookup, even though two other recipients can decrypt
+            # this exact envelope.
+            with pytest.raises(
+                ValueError,
+                match=self.NO_RECIPIENT_MATCH,
+            ):
+                decrypt(
+                    enveloped, outsider_cert, outsider_key, decrypt_options
+                )
+
+            # Swapping in a recipient's private key does not help: the
+            # outsider's certificate still matches no RecipientInfo, so the
+            # identity failure must win before any key unwrap is attempted.
+            with pytest.raises(
+                ValueError,
+                match=self.NO_RECIPIENT_MATCH,
+            ):
+                decrypt(enveloped, outsider_cert, key_one, decrypt_options)
+
+            # Conversely, a recipient certificate paired with an outsider key
+            # selects the correct RecipientInfo but must never recover the
+            # plaintext another recipient is entitled to.
+            self._assert_wrong_key_never_recovers_plaintext(
+                decrypt, enveloped, cert_one, outsider_key, decrypt_options
+            )
+
+    def test_cross_recipient_key_mismatch_never_leaks_plaintext(
+        self,
+        matrix: list[
+            tuple[
+                serialization.Encoding,
+                _ContentEncryptionAlgorithm,
+                list[pkcs7.PKCS7Options],
+                bytes,
+            ]
+        ],
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+        recipient_two: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> None:
+        cert_one, _ = recipient_one
+        _cert_two, key_two = recipient_two
+        for encoding, _content_algorithm, options, enveloped in matrix:
+            decrypt = self._decrypt_for_encoding(encoding)
+            decrypt_options = self._decrypt_options(options)
+
+            # Recipient one's certificate selects recipient one's
+            # RecipientInfo, but recipient two's key cannot unwrap the session
+            # key inside it. That failure must stay within the existing
+            # contract and must never return the shared plaintext merely
+            # because recipient two is also a valid recipient of the envelope.
+            self._assert_wrong_key_never_recovers_plaintext(
+                decrypt, enveloped, cert_one, key_two, decrypt_options
+            )
+
+    def test_envelope_carries_one_recipient_info_per_certificate(
+        self,
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+        recipient_two: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> None:
+        cert_one, _ = recipient_one
+        cert_two, _ = recipient_two
+
+        # Recipient selection happens per RecipientInfo, so assert the envelope
+        # really carries a distinct one for every certificate handed to the
+        # builder. IssuerAndSerialNumber is a UTF8String (tag 0x0c) containing
+        # each certificate's common name.
+        def common_name_tlv(certificate: x509.Certificate) -> bytes:
+            common_name = certificate.subject.get_attributes_for_oid(
+                NameOID.COMMON_NAME
+            )[0].value
+            assert isinstance(common_name, str)
+            encoded = common_name.encode("utf-8")
+            return b"\x0c" + bytes([len(encoded)]) + encoded
+
+        enveloped = (
+            pkcs7.PKCS7EnvelopeBuilder()
+            .set_data(self.DATA)
+            .add_recipient(cert_one)
+            .add_recipient(cert_two)
+            .encrypt(serialization.Encoding.DER, [])
+        )
+        assert enveloped.count(common_name_tlv(cert_one)) == 1
+        assert enveloped.count(common_name_tlv(cert_two)) == 1
+
+    def test_single_recipient_roundtrip_remains_stable_across_matrix(
+        self,
+        recipient_one: tuple[x509.Certificate, rsa.RSAPrivateKey],
+    ) -> None:
+        cert_one, key_one = recipient_one
+        for content_algorithm in (algorithms.AES128, algorithms.AES256):
+            for encoding in (
+                serialization.Encoding.DER,
+                serialization.Encoding.PEM,
+                serialization.Encoding.SMIME,
+            ):
+                option_sets: list[list[pkcs7.PKCS7Options]] = [
+                    [],
+                    [pkcs7.PKCS7Options.Binary],
+                ]
+                if encoding == serialization.Encoding.SMIME:
+                    option_sets.append([pkcs7.PKCS7Options.Text])
+                decrypt = self._decrypt_for_encoding(encoding)
+                for options in option_sets:
+                    enveloped = (
+                        pkcs7.PKCS7EnvelopeBuilder()
+                        .set_data(self.DATA)
+                        .set_content_encryption_algorithm(content_algorithm)
+                        .add_recipient(cert_one)
+                        .encrypt(encoding, options)
+                    )
+                    recovered = decrypt(
+                        enveloped,
+                        cert_one,
+                        key_one,
+                        self._decrypt_options(options),
+                    )
+                    assert recovered == self._expected_plaintext(options)
 
 
 class TestPKCS7SerializeCerts:
