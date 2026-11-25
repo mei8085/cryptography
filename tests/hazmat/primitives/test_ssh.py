@@ -2,9 +2,11 @@
 # 2.0, and the BSD License. See the LICENSE file in the root of this repository
 # for complete details.
 
+from __future__ import annotations
 
 import base64
 import datetime
+import itertools
 import os
 import typing
 
@@ -1723,6 +1725,7 @@ class TestSSHCertificate:
         )
         cert = load_ssh_public_identity(data)
         assert isinstance(cert, SSHCertificate)
+        cert.verify_cert_signature()
         assert cert.valid_principals == []
         assert cert.extensions == {}
         assert cert.critical_options == {}
@@ -1789,6 +1792,358 @@ class TestSSHCertificateBuilder:
             signature_key.public_numbers()
             == private_key.public_key().public_numbers()
         )
+
+    def test_generated_cert_round_trip_fields_and_signature(self):
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+        serial = 0x0123456789ABCDEF
+        valid_after = 1_700_000_000
+        valid_before = 1_800_000_000
+        principals = [b"principal-alice", b"principal-bob"]
+        key_id = b"round-trip-key-id"
+
+        cert = (
+            SSHCertificateBuilder()
+            .public_key(subject_key)
+            .serial(serial)
+            .type(SSHCertificateType.HOST)
+            .key_id(key_id)
+            .valid_principals(principals)
+            .valid_after(valid_after)
+            .valid_before(valid_before)
+            .add_critical_option(b"force-command", b"/usr/bin/shell")
+            .add_critical_option(b"verify-required", b"")
+            .add_extension(b"permit-pty", b"")
+            .add_extension(b"custom@example", b"extension value")
+            .sign(ca_key)
+        )
+        cert.verify_cert_signature()
+
+        reloaded = load_ssh_public_identity(cert.public_bytes())
+        assert isinstance(reloaded, SSHCertificate)
+        reloaded.verify_cert_signature()
+
+        assert reloaded.public_bytes() == cert.public_bytes()
+        assert reloaded.nonce == cert.nonce
+        assert reloaded.serial == serial
+        assert reloaded.type is SSHCertificateType.HOST
+        assert reloaded.key_id == key_id
+        assert reloaded.valid_principals == principals
+        assert reloaded.valid_after == valid_after
+        assert reloaded.valid_before == valid_before
+        assert reloaded.critical_options == {
+            b"force-command": b"/usr/bin/shell",
+            b"verify-required": b"",
+        }
+        assert list(reloaded.critical_options) == [
+            b"force-command",
+            b"verify-required",
+        ]
+        assert reloaded.extensions == {
+            b"custom@example": b"extension value",
+            b"permit-pty": b"",
+        }
+        assert list(reloaded.extensions) == [
+            b"custom@example",
+            b"permit-pty",
+        ]
+
+        public_key = reloaded.public_key()
+        assert isinstance(public_key, ed25519.Ed25519PublicKey)
+        assert public_key.public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ) == subject_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+        signature_key = reloaded.signature_key()
+        assert isinstance(signature_key, ed25519.Ed25519PublicKey)
+        assert signature_key.public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ) == ca_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    @pytest.mark.parametrize(
+        "cert_type",
+        [SSHCertificateType.USER, SSHCertificateType.HOST],
+    )
+    def test_all_principals_and_explicit_principals_are_distinct(
+        self, cert_type
+    ):
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+
+        def build_cert(
+            all_principals: bool,
+            principals: list[bytes] | None = None,
+        ) -> SSHCertificate:
+            builder = (
+                SSHCertificateBuilder()
+                .public_key(subject_key)
+                .type(cert_type)
+                .valid_after(100)
+                .valid_before(200)
+            )
+            if all_principals:
+                builder = builder.valid_for_all_principals()
+            else:
+                assert principals is not None
+                builder = builder.valid_principals(principals)
+            signed = builder.sign(ca_key).public_bytes()
+            cert = load_ssh_public_identity(signed)
+            assert isinstance(cert, SSHCertificate)
+            assert cert.public_bytes() == signed
+            return cert
+
+        unrestricted = build_cert(True)
+        explicit = build_cert(False, [b"alice"])
+
+        unrestricted.verify_cert_signature()
+        explicit.verify_cert_signature()
+
+        # In the OpenSSH wire format an empty principals field is the
+        # wildcard, not an accidentally omitted/empty explicit list.
+        assert unrestricted.valid_principals == []
+        assert explicit.valid_principals == [b"alice"]
+        for principal in (b"alice", b"bob", b"any.example"):
+            allowed_for_all = (
+                not unrestricted.valid_principals
+                or principal in unrestricted.valid_principals
+            )
+            assert allowed_for_all
+            assert (principal in explicit.valid_principals) == (
+                principal == b"alice"
+            )
+        assert b"alice" in explicit.valid_principals
+        assert b"bob" not in explicit.valid_principals
+        assert unrestricted.type is cert_type
+        assert explicit.type is cert_type
+
+    def test_principal_permutations_preserve_authorization_meaning(self):
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+        principals = [b"alice", b"bob"]
+        reloaded_certs: list[SSHCertificate] = []
+
+        for order in itertools.permutations(principals):
+            cert = (
+                SSHCertificateBuilder()
+                .public_key(subject_key)
+                .type(SSHCertificateType.USER)
+                .key_id(b"principal-permutation")
+                .valid_principals(list(order))
+                .valid_after(100)
+                .valid_before(200)
+                .sign(ca_key)
+            )
+            reloaded = load_ssh_public_identity(cert.public_bytes())
+            assert isinstance(reloaded, SSHCertificate)
+            assert reloaded.public_bytes() == cert.public_bytes()
+            reloaded.verify_cert_signature()
+            # Principal order is preserved by the wire format. Membership
+            # is what carries the certificate's authorization meaning.
+            assert reloaded.valid_principals == list(order)
+            assert set(reloaded.valid_principals) == set(principals)
+            reloaded_certs.append(reloaded)
+
+        for principal in principals:
+            decisions = {
+                principal in cert.valid_principals for cert in reloaded_certs
+            }
+            assert decisions == {True}
+
+        decisions = {
+            b"mallory" in cert.valid_principals for cert in reloaded_certs
+        }
+        assert decisions == {False}
+
+    def test_option_permutations_are_canonical_after_round_trip(
+        self, monkeypatch
+    ):
+        # Fixed nonces and deterministic Ed25519 signatures make different
+        # insertion orders comparable at the serialized-byte level.
+        monkeypatch.setattr(os, "urandom", lambda size: b"\x33" * size)
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+        critical_options = [
+            (b"zeta-critical", b"zeta-value"),
+            (b"alpha-critical", b"alpha-value"),
+            (b"middle-critical", b""),
+        ]
+        extensions = [
+            (b"zeta-extension", b""),
+            (b"alpha-extension", b"alpha-ext-value"),
+            (b"middle-extension", b"middle-ext-value"),
+        ]
+        expected_critical = [
+            (b"alpha-critical", b"alpha-value"),
+            (b"middle-critical", b""),
+            (b"zeta-critical", b"zeta-value"),
+        ]
+        expected_extensions = [
+            (b"alpha-extension", b"alpha-ext-value"),
+            (b"middle-extension", b"middle-ext-value"),
+            (b"zeta-extension", b""),
+        ]
+        expected_bytes: bytes | None = None
+
+        for critical_order in itertools.permutations(critical_options):
+            for extension_order in itertools.permutations(extensions):
+                builder = (
+                    SSHCertificateBuilder()
+                    .public_key(subject_key)
+                    .type(SSHCertificateType.USER)
+                    .valid_principals([b"alice"])
+                    .valid_after(100)
+                    .valid_before(200)
+                )
+                for name, value in critical_order:
+                    builder = builder.add_critical_option(name, value)
+                for name, value in extension_order:
+                    builder = builder.add_extension(name, value)
+
+                cert = builder.sign(ca_key)
+                reloaded = load_ssh_public_identity(cert.public_bytes())
+                assert isinstance(reloaded, SSHCertificate)
+                assert reloaded.public_bytes() == cert.public_bytes()
+                reloaded.verify_cert_signature()
+                assert list(reloaded.critical_options.items()) == (
+                    expected_critical
+                )
+                assert list(reloaded.extensions.items()) == (
+                    expected_extensions
+                )
+                if expected_bytes is None:
+                    expected_bytes = reloaded.public_bytes()
+                else:
+                    assert reloaded.public_bytes() == expected_bytes
+
+    def test_builder_method_order_does_not_change_round_trip(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(os, "urandom", lambda size: b"\x44" * size)
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+
+        first = (
+            SSHCertificateBuilder()
+            .public_key(subject_key)
+            .serial(7)
+            .type(SSHCertificateType.HOST)
+            .key_id(b"method-order")
+            .valid_principals([b"host.example"])
+            .valid_after(100)
+            .valid_before(200)
+            .add_critical_option(b"force-command", b"/usr/bin/shell")
+            .add_extension(b"permit-pty", b"")
+            .sign(ca_key)
+        )
+        second = (
+            SSHCertificateBuilder()
+            .add_extension(b"permit-pty", b"")
+            .add_critical_option(b"force-command", b"/usr/bin/shell")
+            .valid_before(200)
+            .valid_after(100)
+            .valid_principals([b"host.example"])
+            .key_id(b"method-order")
+            .type(SSHCertificateType.HOST)
+            .serial(7)
+            .public_key(subject_key)
+            .sign(ca_key)
+        )
+
+        reloaded_first = load_ssh_public_identity(first.public_bytes())
+        reloaded_second = load_ssh_public_identity(second.public_bytes())
+        assert isinstance(reloaded_first, SSHCertificate)
+        assert isinstance(reloaded_second, SSHCertificate)
+        reloaded_first.verify_cert_signature()
+        reloaded_second.verify_cert_signature()
+        assert reloaded_second.public_bytes() == reloaded_first.public_bytes()
+        assert reloaded_second.serial == 7
+        assert reloaded_second.type is SSHCertificateType.HOST
+        assert reloaded_second.key_id == b"method-order"
+        assert reloaded_second.valid_principals == [b"host.example"]
+        assert (reloaded_second.valid_after, reloaded_second.valid_before) == (
+            100,
+            200,
+        )
+        assert reloaded_second.critical_options == {
+            b"force-command": b"/usr/bin/shell"
+        }
+        assert reloaded_second.extensions == {b"permit-pty": b""}
+
+    @pytest.mark.parametrize(
+        ("field_name", "old", "new"),
+        [
+            (
+                "valid_principals",
+                b"principal-aaaaaa",
+                b"principal-bbbbbb",
+            ),
+            (
+                "valid_after",
+                (0x0102030405060708).to_bytes(8, "big"),
+                (0x2122232425262728).to_bytes(8, "big"),
+            ),
+            (
+                "valid_before",
+                (0x1112131415161718).to_bytes(8, "big"),
+                (0x3132333435363738).to_bytes(8, "big"),
+            ),
+            (
+                "critical_options",
+                b"critical-value-aaaa",
+                b"critical-value-bbbb",
+            ),
+            (
+                "extensions",
+                b"extension-value-aaaa",
+                b"extension-value-bbbb",
+            ),
+        ],
+    )
+    def test_round_tripped_field_tampering_invalidates_signature(
+        self, field_name, old, new
+    ):
+        ca_key = ed25519.Ed25519PrivateKey.generate()
+        subject_key = ed25519.Ed25519PrivateKey.generate().public_key()
+        cert = (
+            SSHCertificateBuilder()
+            .public_key(subject_key)
+            .type(SSHCertificateType.USER)
+            .key_id(b"tamper-test")
+            .valid_principals([b"principal-aaaaaa"])
+            .valid_after(0x0102030405060708)
+            .valid_before(0x1112131415161718)
+            .add_critical_option(b"force-command", b"critical-value-aaaa")
+            .add_extension(b"custom@example", b"extension-value-aaaa")
+            .sign(ca_key)
+        )
+
+        line = cert.public_bytes()
+        key_type, encoded_blob = line.split(b" ", 1)
+        blob = bytearray(base64.b64decode(encoded_blob))
+        assert blob.count(old) == 1
+        offset = blob.find(old)
+        blob[offset : offset + len(old)] = new
+        tampered_line = key_type + b" " + base64.b64encode(bytes(blob))
+
+        tampered = load_ssh_public_identity(tampered_line)
+        assert isinstance(tampered, SSHCertificate)
+        if field_name == "valid_principals":
+            assert tampered.valid_principals == [b"principal-bbbbbb"]
+        elif field_name == "valid_after":
+            assert tampered.valid_after == int.from_bytes(new, "big")
+        elif field_name == "valid_before":
+            assert tampered.valid_before == int.from_bytes(new, "big")
+        elif field_name == "critical_options":
+            assert tampered.critical_options == {
+                b"force-command": b"critical-value-bbbb"
+            }
+        else:
+            assert tampered.extensions == {
+                b"custom@example": b"extension-value-bbbb"
+            }
+
+        with pytest.raises(InvalidSignature):
+            tampered.verify_cert_signature()
 
     def test_public_key_errors(self):
         public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
