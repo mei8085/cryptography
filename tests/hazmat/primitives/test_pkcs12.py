@@ -981,6 +981,340 @@ def test_pkcs12_ordering():
     assert a_idx < b_idx < c_idx
 
 
+def _make_identity(common_name):
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, common_name)]
+    )
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now)
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _cert_fingerprint(cert):
+    return cert.fingerprint(hashes.SHA256())
+
+
+def _spki(public_key):
+    return public_key.public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+def _index_pkcs12_certs(p12_certs):
+    return {
+        _cert_fingerprint(p12_cert.certificate): p12_cert
+        for p12_cert in p12_certs
+    }
+
+
+@pytest.mark.skip_fips(
+    reason="PKCS12 unsupported in FIPS mode. So much bad crypto in it."
+)
+class TestPKCS12RoundTrip:
+    @pytest.mark.parametrize(
+        ("encryption_algorithm", "password"),
+        [
+            (serialization.NoEncryption(), None),
+            (serialization.BestAvailableEncryption(b"password"), b"password"),
+        ],
+    )
+    def test_reexport_preserves_key_pairing_and_friendly_names(
+        self, encryption_algorithm, password
+    ):
+        # Build an identity carrying its private key, plus additional
+        # certificates coming from different sources (freshly generated
+        # identities and certificates loaded from vectors).
+        key, cert = _make_identity("roundtrip-identity")
+        _, extra_cert = _make_identity("roundtrip-extra")
+        vector_cert = _load_cert(
+            os.path.join("x509", "custom", "dsa_selfsigned_ca.pem")
+        )
+        other_vector_cert = _load_cert(
+            os.path.join("x509", "letsencryptx3.pem")
+        )
+
+        additional_certs = [
+            PKCS12Certificate(extra_cert, b"extra-friendly"),
+            PKCS12Certificate(vector_cert, b"vector-friendly"),
+            PKCS12Certificate(other_vector_cert, None),
+        ]
+        p12 = serialize_key_and_certificates(
+            b"identity",
+            key,
+            cert,
+            additional_certs,
+            encryption_algorithm,
+        )
+
+        # Load through the object API and check the identity association:
+        # the private key is still paired with its own certificate, and each
+        # additional certificate keeps its own friendly name.
+        loaded = load_pkcs12(p12, password)
+        assert loaded.key is not None
+        assert isinstance(loaded.key, ec.EllipticCurvePrivateKey)
+        assert loaded.cert is not None
+        assert loaded.cert.certificate == cert
+        assert loaded.cert.friendly_name == b"identity"
+        assert _spki(loaded.key.public_key()) == _spki(key.public_key())
+        assert loaded.additional_certs == additional_certs
+
+        # The legacy tuple API must report the same pairing.
+        parsed_key, parsed_cert, parsed_more_certs = load_key_and_certificates(
+            p12, password
+        )
+        assert parsed_cert == cert
+        assert parsed_key is not None
+        assert _spki(parsed_key.public_key()) == _spki(key.public_key())
+        assert parsed_more_certs == [
+            p12_cert.certificate for p12_cert in additional_certs
+        ]
+
+        # Re-export the loaded bundle, carrying the friendly names over
+        # explicitly. The second generation must preserve the key pairing
+        # and the per-certificate attributes.
+        reexported = serialize_key_and_certificates(
+            loaded.cert.friendly_name,
+            loaded.key,
+            loaded.cert.certificate,
+            [
+                PKCS12Certificate(p12_cert.certificate, p12_cert.friendly_name)
+                for p12_cert in loaded.additional_certs
+            ],
+            encryption_algorithm,
+        )
+        reloaded = load_pkcs12(reexported, password)
+        assert reloaded.key is not None
+        assert reloaded.cert is not None
+        assert reloaded.cert.certificate == cert
+        assert reloaded.cert.friendly_name == b"identity"
+        assert _spki(reloaded.key.public_key()) == _spki(key.public_key())
+        assert reloaded.additional_certs == additional_certs
+
+    @pytest.mark.parametrize(
+        ("encryption_algorithm", "password"),
+        [
+            (serialization.NoEncryption(), None),
+            (serialization.BestAvailableEncryption(b"password"), b"password"),
+        ],
+    )
+    def test_shuffled_additional_certs_keep_their_identities(
+        self, encryption_algorithm, password
+    ):
+        # Two private-key identities, plus additional certificates from
+        # different sources.
+        first_key, first_cert = _make_identity("first-identity")
+        second_key, second_cert = _make_identity("second-identity")
+        vector_cert = _load_cert(
+            os.path.join("x509", "custom", "dsa_selfsigned_ca.pem")
+        )
+        other_vector_cert = _load_cert(
+            os.path.join("x509", "letsencryptx3.pem")
+        )
+
+        additional_certs = [
+            PKCS12Certificate(second_cert, b"second-friendly"),
+            PKCS12Certificate(vector_cert, b"vector-friendly"),
+            PKCS12Certificate(other_vector_cert, None),
+        ]
+        p12 = serialize_key_and_certificates(
+            b"first",
+            first_key,
+            first_cert,
+            additional_certs,
+            encryption_algorithm,
+        )
+
+        # Re-export with the additional certificates in a different order.
+        loaded = load_pkcs12(p12, password)
+        assert loaded.cert is not None
+        assert loaded.key is not None
+        assert isinstance(loaded.key, ec.EllipticCurvePrivateKey)
+        shuffled_additional = list(reversed(loaded.additional_certs))
+        assert [p12_cert.certificate for p12_cert in shuffled_additional] == [
+            other_vector_cert,
+            vector_cert,
+            second_cert,
+        ]
+        shuffled = serialize_key_and_certificates(
+            loaded.cert.friendly_name,
+            loaded.key,
+            loaded.cert.certificate,
+            shuffled_additional,
+            encryption_algorithm,
+        )
+
+        # Identity is keyed on the certificate itself, not its position:
+        # every friendly name must follow its own certificate.
+        reloaded = load_pkcs12(shuffled, password)
+        assert reloaded.key is not None
+        assert reloaded.cert is not None
+        assert reloaded.cert.certificate == first_cert
+        assert reloaded.cert.friendly_name == b"first"
+        assert _spki(reloaded.key.public_key()) == _spki(
+            first_key.public_key()
+        )
+        reloaded_by_fp = _index_pkcs12_certs(reloaded.additional_certs)
+        assert set(reloaded_by_fp) == {
+            _cert_fingerprint(second_cert),
+            _cert_fingerprint(vector_cert),
+            _cert_fingerprint(other_vector_cert),
+        }
+        assert (
+            reloaded_by_fp[_cert_fingerprint(second_cert)].friendly_name
+            == b"second-friendly"
+        )
+        assert (
+            reloaded_by_fp[_cert_fingerprint(vector_cert)].friendly_name
+            == b"vector-friendly"
+        )
+        assert (
+            reloaded_by_fp[_cert_fingerprint(other_vector_cert)].friendly_name
+            is None
+        )
+
+        # The second, key-less identity stays intact as an additional
+        # certificate, and its public key still matches its own private key.
+        recovered_second = reloaded_by_fp[_cert_fingerprint(second_cert)]
+        assert _spki(recovered_second.certificate.public_key()) == _spki(
+            second_key.public_key()
+        )
+
+        # And the reported order is the shuffled order, verbatim.
+        assert [
+            p12_cert.certificate for p12_cert in reloaded.additional_certs
+        ] == [
+            other_vector_cert,
+            vector_cert,
+            second_cert,
+        ]
+
+    @pytest.mark.parametrize(
+        ("encryption_algorithm", "password"),
+        [
+            (serialization.NoEncryption(), None),
+            (serialization.BestAvailableEncryption(b"password"), b"password"),
+        ],
+    )
+    def test_cert_only_collection_round_trip(
+        self, encryption_algorithm, password
+    ):
+        # A PKCS#12 container may hold only certificates, with no private key.
+        generated_cert = _make_identity("cert-only-generated")[1]
+        vector_cert = _load_cert(
+            os.path.join("x509", "custom", "dsa_selfsigned_ca.pem")
+        )
+        other_vector_cert = _load_cert(
+            os.path.join("x509", "letsencryptx3.pem")
+        )
+        certificates = [
+            PKCS12Certificate(generated_cert, b"generated-friendly"),
+            PKCS12Certificate(vector_cert, b"vector-friendly"),
+            PKCS12Certificate(other_vector_cert, None),
+        ]
+
+        p12 = serialize_key_and_certificates(
+            None, None, None, certificates, encryption_algorithm
+        )
+
+        loaded = load_pkcs12(p12, password)
+        assert loaded.key is None
+        assert loaded.cert is None
+        assert loaded.additional_certs == certificates
+
+        # Re-export, this time shuffling the order. Each certificate keeps
+        # its own friendly name regardless of position.
+        shuffled = serialize_key_and_certificates(
+            None,
+            None,
+            None,
+            list(reversed(loaded.additional_certs)),
+            encryption_algorithm,
+        )
+        reloaded = load_pkcs12(shuffled, password)
+        assert reloaded.key is None
+        assert reloaded.cert is None
+        reloaded_by_fp = _index_pkcs12_certs(reloaded.additional_certs)
+        assert set(reloaded_by_fp) == {
+            _cert_fingerprint(generated_cert),
+            _cert_fingerprint(vector_cert),
+            _cert_fingerprint(other_vector_cert),
+        }
+        assert (
+            reloaded_by_fp[_cert_fingerprint(generated_cert)].friendly_name
+            == b"generated-friendly"
+        )
+        assert (
+            reloaded_by_fp[_cert_fingerprint(vector_cert)].friendly_name
+            == b"vector-friendly"
+        )
+        assert (
+            reloaded_by_fp[_cert_fingerprint(other_vector_cert)].friendly_name
+            is None
+        )
+        assert [
+            p12_cert.certificate for p12_cert in reloaded.additional_certs
+        ] == [other_vector_cert, vector_cert, generated_cert]
+
+    @pytest.mark.parametrize(
+        ("encryption_algorithm", "password"),
+        [
+            (serialization.BestAvailableEncryption(b"password"), b"password"),
+            (
+                serialization.PrivateFormat.PKCS12.encryption_builder().build(
+                    b"password"
+                ),
+                b"password",
+            ),
+        ],
+    )
+    def test_wrong_password_returns_nothing(
+        self, encryption_algorithm, password
+    ):
+        key, cert = _make_identity("wrong-password-identity")
+        vector_cert = _load_cert(
+            os.path.join("x509", "custom", "dsa_selfsigned_ca.pem")
+        )
+        p12 = serialize_key_and_certificates(
+            b"identity",
+            key,
+            cert,
+            [PKCS12Certificate(vector_cert, b"vector-friendly")],
+            encryption_algorithm,
+        )
+
+        # A wrong password must fail outright. Neither loading API returns a
+        # partially parsed bundle, so no usable key or certificate leaks out.
+        with pytest.raises(ValueError):
+            load_pkcs12(p12, b"not the password")
+        with pytest.raises(ValueError):
+            load_key_and_certificates(p12, b"not the password")
+        with pytest.raises(ValueError):
+            load_pkcs12(p12, None)
+        with pytest.raises(ValueError):
+            load_key_and_certificates(p12, None)
+
+        # The correct password still loads the complete identity afterwards.
+        loaded = load_pkcs12(p12, password)
+        assert loaded.key is not None
+        assert loaded.cert is not None
+        assert loaded.cert.certificate == cert
+        assert loaded.cert.friendly_name == b"identity"
+        assert _spki(loaded.key.public_key()) == _spki(key.public_key())
+        assert loaded.additional_certs == [
+            PKCS12Certificate(vector_cert, b"vector-friendly")
+        ]
+
+
 class TestPKCS12Objects:
     def test_certificate_constructor(self):
         with pytest.raises(TypeError):
